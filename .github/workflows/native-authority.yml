@@ -1,0 +1,181 @@
+name: Native authority races (manual approval only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval_url:
+        description: 'Separate Founder Stage-B approval comment URL (not Stage A)'
+        required: true
+        type: string
+      reviewed_control_sha:
+        description: 'Full control commit SHA explicitly approved for this one run'
+        required: true
+        type: string
+      safety_confirmation:
+        description: 'Type STAGE_B_APPROVED_ZERO_COST_SYNTHETIC_ONLY after preflight'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: matchlatch-native-authority-single-run
+  cancel-in-progress: false
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Require separate approval and record runner
+        timeout-minutes: 1
+        env:
+          APPROVAL_URL: ${{ inputs.approval_url }}
+          REVIEWED_SHA: ${{ inputs.reviewed_control_sha }}
+          CONFIRMATION: ${{ inputs.safety_confirmation }}
+        run: |
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = atravis817/matchlatch-native-test-runner
+          test "$GITHUB_REPOSITORY_OWNER" = atravis817
+          test "$GITHUB_ACTOR" = atravis817
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(id -u)" != 0
+          test "$CONFIRMATION" = STAGE_B_APPROVED_ZERO_COST_SYNTHETIC_ONLY
+          test "$REVIEWED_SHA" = "$GITHUB_SHA"
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$APPROVAL_URL" =~ ^https://github\.com/atravis817/matchlatch/pull/9#issuecomment-[0-9]+$ ]]
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          printf 'Control=%s run=%s attempt=%s approval=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$APPROVAL_URL"
+          printf 'Image=%s version=%s UID=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$(id -u)"
+          echo 'Human preflight must verify public standard-runner $0 eligibility, unchanged isolation and actual public log retention. Inputs are attestations, not automated approval verification.'
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+
+      - name: Verify source and prepare pinned native tools (no sudo)
+        timeout-minutes: 10
+        run: |
+          task_root="/tmp/ml018t-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$task_root"
+          mkdir -m 700 "$task_root"
+          env -i PATH=/usr/bin:/bin LANG=C TASK_ROOT="$task_root" /bin/bash --noprofile --norc -euo pipefail <<'PREPARE'
+          umask 077
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+          for tool in git curl sha256sum tar xz bzip2 gcc make bison flex perl python3 timeout; do command -v "$tool" >/dev/null; done
+          for tool in git gcc make bison flex perl python3; do "$tool" --version | head -n 1; done
+          mkdir "$TASK_ROOT/cluster" "$TASK_ROOT/downloads" "$TASK_ROOT/source"
+          git -C "$TASK_ROOT/source" -c core.hooksPath=/dev/null init -q
+          timeout --kill-after=5s 90s git -C "$TASK_ROOT/source" -c core.hooksPath=/dev/null fetch --no-tags https://github.com/atravis817/matchlatch.git 163c87a4d81dd2d61572571a71ea73d7113f76ae
+          git -C "$TASK_ROOT/source" -c core.hooksPath=/dev/null checkout --detach -q FETCH_HEAD
+          cd "$TASK_ROOT/source"
+          test "$(git rev-parse HEAD)" = 163c87a4d81dd2d61572571a71ea73d7113f76ae
+          test "$(git rev-parse 'HEAD^{tree}')" = fdbb6d1cdf83289d4fed49cd55bebf27266ca106
+          git fsck --full --strict
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git ls-tree -r HEAD | wc -l)" = 237
+          if git ls-tree -r HEAD | /usr/bin/grep -Eq '^(120000|160000) '; then echo 'STOP: symlink/submodule'; exit 1; fi
+          printf 'Verified source=%s tree=%s blobs=237\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')"
+          cd "$TASK_ROOT/downloads"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --retry 0 --connect-timeout 10 --max-time 75 -o node.tar.xz https://nodejs.org/dist/v24.22.0/node-v24.22.0-linux-x64.tar.xz
+          echo 'cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008  node.tar.xz' | sha256sum --check --strict
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --retry 0 --connect-timeout 10 --max-time 75 -o postgres.tar.bz2 https://ftp.postgresql.org/pub/source/v17.11/postgresql-17.11.tar.bz2
+          echo 'dd27f2b3c59e73ed14aa3324901242bf69a032a6347805f274e6260322d42979  postgres.tar.bz2' | sha256sum --check --strict
+          tar -xJf node.tar.xz -C "$TASK_ROOT" --no-same-owner
+          tar -xjf postgres.tar.bz2 -C "$TASK_ROOT" --no-same-owner
+          cd "$TASK_ROOT/postgresql-17.11"
+          timeout --kill-after=5s 45s ./configure --prefix="$TASK_ROOT/pg" --without-readline --without-zlib --without-icu > "$TASK_ROOT/configure.log" 2>&1
+          timeout --kill-after=10s 360s make -j2 > "$TASK_ROOT/build.log" 2>&1
+          timeout --kill-after=5s 45s make install > "$TASK_ROOT/install.log" 2>&1
+          export PATH="$TASK_ROOT/pg/bin:$TASK_ROOT/node-v24.22.0-linux-x64/bin:/usr/bin:/bin"
+          test "$(node --version)" = v24.22.0
+          for tool in postgres initdb pg_ctl psql createdb; do test "$("$tool" --version)" = "$tool (PostgreSQL) 17.11"; done
+          node --version
+          postgres --version
+          echo 'Prepared tools only; no cluster initialized by this step.'
+          PREPARE
+
+      - name: Six synthetic native race scenarios (one invocation)
+        timeout-minutes: 2
+        run: |
+          task_root="/tmp/ml018t-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          env -i PATH="$task_root/pg/bin:$task_root/node-v24.22.0-linux-x64/bin:/usr/bin:/bin" LANG=C TASK_ROOT="$task_root" TMPDIR="$task_root/cluster" /bin/bash --noprofile --norc -euo pipefail <<'RACES'
+          cd "$TASK_ROOT/source"
+          test "$(git rev-parse HEAD)" = 163c87a4d81dd2d61572571a71ea73d7113f76ae
+          test "$(git rev-parse 'HEAD^{tree}')" = fdbb6d1cdf83289d4fed49cd55bebf27266ca106
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(id -u)" != 0
+          test "$(node --version)" = v24.22.0
+          test "$(postgres --version)" = 'postgres (PostgreSQL) 17.11'
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          started=$SECONDS
+          set +e
+          MATCHLATCH_NATIVE_LOCAL_APPROVED=1 timeout --kill-after=5s 105s bash scripts/run-shopify-authority-native-local.sh 2>&1 | tee "$TASK_ROOT/launcher.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          printf 'Harness exit=%s elapsed_seconds=%s\n' "$result" "$((SECONDS-started))"
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          test "$result" = 0
+          grep -Fx 'Native races: 6 PASS / 0 FAIL / 0 SKIP' "$TASK_ROOT/launcher.log"
+          RACES
+
+      - name: Always verify owned cluster stopped and remove temporary data
+        if: ${{ always() }}
+        timeout-minutes: 1
+        run: |
+          task_root="/tmp/ml018t-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          env -i PATH=/usr/bin:/bin LANG=C TASK_ROOT="$task_root" TASK_PARENT=/tmp /usr/bin/python3 <<'CLEANUP'
+          import os, pathlib, shutil, socket, subprocess
+          root = pathlib.Path(os.environ['TASK_ROOT'])
+          parent = pathlib.Path(os.environ['TASK_PARENT']).resolve()
+          if not root.exists():
+              print('CLEANUP: no task directory allocated')
+              raise SystemExit(0)
+          assert not root.is_symlink() and root.resolve().parent == parent
+          assert root.stat().st_uid == os.getuid() and root.name.startswith('ml018t-')
+          pg = root / 'pg/bin/pg_ctl'
+          postgres = root / 'pg/bin/postgres'
+          for data in (root / 'cluster').glob('matchlatch-018p.*/data'):
+              assert not data.is_symlink() and data.resolve().is_relative_to(root.resolve())
+              assert data.stat().st_uid == os.getuid()
+              pidfile = data / 'postmaster.pid'
+              port = None
+              if pidfile.exists():
+                  lines = pidfile.read_text().splitlines()
+                  pid = int(lines[0]); port = int(lines[3])
+                  proc = pathlib.Path('/proc') / str(pid)
+                  if proc.exists():
+                      assert proc.stat().st_uid == os.getuid()
+                      assert (proc / 'exe').resolve() == postgres.resolve()
+                      args = (proc / 'cmdline').read_bytes().split(b'\0')
+                      assert os.fsencode(str(data)) in args
+                      subprocess.run([str(pg), '-D', str(data), '-m', 'immediate', '-t', '10', '-w', 'stop'], check=True, timeout=15)
+                      assert not proc.exists(), 'Owned postmaster still present'
+                  if port:
+                      with socket.socket() as s:
+                          s.settimeout(1)
+                          assert s.connect_ex(('127.0.0.1', port)) != 0, 'Port still open'
+              if pg.exists():
+                  status = subprocess.run([str(pg), '-D', str(data), 'status'], capture_output=True, timeout=5)
+                  assert status.returncode in (3, 4), 'Server stop not established'
+          for proc in pathlib.Path('/proc').iterdir():
+              if not proc.name.isdigit(): continue
+              try:
+                  if (proc / 'exe').resolve() == postgres.resolve():
+                      raise AssertionError('Owned postgres process remains: ' + proc.name)
+              except (FileNotFoundError, PermissionError): pass
+          for pattern in ('*.log', 'cluster/matchlatch-018p.*/*.log'):
+              for log in sorted(root.glob(pattern)):
+                  assert not log.is_symlink() and log.resolve().is_relative_to(root.resolve())
+                  print('EVIDENCE ' + str(log.relative_to(root)))
+                  print('\n'.join(log.read_text(errors='replace').splitlines()[-160:]))
+          shutil.rmtree(root)
+          assert not root.exists()
+          print('CLEANUP PASS: owned PostgreSQL stopped; task directory removed')
+          CLEANUP
